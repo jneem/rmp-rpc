@@ -136,21 +136,38 @@ struct Server<S: ServiceWithClient> {
     pending_responses: mpsc::UnboundedReceiver<(u32, Result<Value, Value>)>,
     // We hand out a clone of this whenever we call `service.handle_request`.
     response_sender: mpsc::UnboundedSender<(u32, Result<Value, Value>)>,
-    // TODO: We partially add backpressure by ensuring that the pending responses get sent out
-    // before we accept new requests. However, it could be that there are lots of response
-    // computations out there that haven't sent pending responses yet; we don't yet have a way to
-    // apply backpressure there.
+    // How many futures were spawned but haven't yet returned? If this is too large, we can pause
+    // reading from the input stream, thereby applying backpressure.
+    active_jobs: usize,
+    // This sender/receiver pair is how we count the number of active jobs: every job that finishes
+    // sends a message along job_count_send, and then we count the messages received.
+    //
+    // It's probably possible to get rid of these and replace active_jobs with an Arc<AtomicUsize>,
+    // but I'm worried about the possibility that a job will finish on another thread, but we won't
+    // observe the AtomicUsize decrement straight away and so we won't start a new job. If at the
+    // same time nothing schedules a wakeup, we might never get polled again. This sender/receiver
+    // solution has the advantage that if we decide not to start another thread, it means that we
+    // polled job_count_recv and got NotReady, and so we're guaranteed to get polled again.
+    job_count_recv: mpsc::UnboundedReceiver<()>,
+    job_count_send: mpsc::UnboundedSender<()>,
+    // An upper bound on the number of jobs we will spawn.
+    job_limit: usize,
 }
 
 impl<S: ServiceWithClient> Server<S> {
-    fn new(service: S, handle: &reactor::Handle) -> Self {
+    fn with_job_limit(service: S, job_limit: usize, handle: &reactor::Handle) -> Self {
         let (send, recv) = mpsc::unbounded();
+        let (job_count_send, job_count_recv) = mpsc::unbounded();
 
         Server {
             service,
             handle: handle.clone(),
             pending_responses: recv,
             response_sender: send,
+            active_jobs: 0,
+            job_count_send,
+            job_count_recv,
+            job_limit,
         }
     }
 
@@ -181,7 +198,7 @@ impl<S: ServiceWithClient> Server<S> {
     }
 
     fn spawn_request_worker<F: Future<Item = Value, Error = Value> + 'static>(
-        &self,
+        &mut self,
         id: u32,
         mut f: F,
     ) {
@@ -201,19 +218,40 @@ impl<S: ServiceWithClient> Server<S> {
             }
             Ok(Async::NotReady) => {
                 // Ok, we can't avoid it: spawn a future on the event loop.
+                self.active_jobs += 1;
+                trace!("Spawning a request worker, {} active", self.active_jobs);
                 let send = self.response_sender.clone();
+                let job_count_send = self.job_count_send.clone();
                 self.handle.spawn(f.then(move |result| {
-                    send.unbounded_send((id, result))
-                            .map_err(|_| ())
+                    trace!("sending the response back");
+                    send.unbounded_send((id, result)).map_err(|_| ())
+                }).then(move |_| {
+                    trace!("sending the job count back");
+                    job_count_send.send(()).then(|_| Ok(()))
                 }));
             }
         }
     }
 
-    fn spawn_notification_worker<F: Future<Item = (), Error = ()> + 'static>(&self, mut f: F) {
+    fn spawn_notification_worker<F: Future<Item = (), Error = ()> + 'static>(&mut self, mut f: F) {
         if let Ok(Async::NotReady) = f.poll() {
-            self.handle.spawn(f);
+            let job_count_send = self.job_count_send.clone();
+            self.active_jobs += 1;
+            trace!("Spawning a notification worker, {} active", self.active_jobs);
+            self.handle
+                .spawn(f.and_then(|_| job_count_send.send(()).then(|_| Ok(()))));
         }
+    }
+
+    fn count_active_jobs(&mut self) -> usize {
+        while let Ok(Async::Ready(x)) = self.job_count_recv.poll() {
+            // We should never get `None`, because that would mean that the last sender has been
+            // dropped, but we store a sender!
+            assert_eq!(x, Some(()));
+            self.active_jobs -= 1;
+        }
+        trace!("counted {} active jobs", self.active_jobs);
+        self.active_jobs
     }
 }
 
@@ -222,6 +260,9 @@ impl<S: ServiceWithClient> Server<S> {
 trait MessageHandler {
     // We just received `msg` on our input stream. Handle it.
     fn handle_incoming(&mut self, msg: Message);
+
+    // Are we ready to handle a new incoming message?
+    fn ready_to_handle(&mut self) -> bool;
 
     // Try to push out all of the outgoing messages (e.g. responses in the case of a server,
     // notifications+requests in the case of a client) onto the sink. Return Ok(Async::Ready(()))
@@ -239,8 +280,11 @@ trait MessageHandler {
 }
 
 type ResponseTx = oneshot::Sender<Result<Value, Value>>;
+
 /// Future response to a request. It resolved once the response is available.
-// TODO: return an error if the stream has an error
+///
+/// An error here means that the connection to the server was closed before a response was
+/// received.
 pub struct Response(oneshot::Receiver<Result<Value, Value>>);
 
 type AckTx = oneshot::Sender<()>;
@@ -475,6 +519,10 @@ impl<S: Service> MessageHandler for Server<S> {
     ) -> Poll<(), io::Error> {
         self.send_responses(sink)
     }
+
+    fn ready_to_handle(&mut self) -> bool {
+        self.count_active_jobs() < self.job_limit
+    }
 }
 
 impl MessageHandler for InnerClient {
@@ -498,6 +546,10 @@ impl MessageHandler for InnerClient {
         self.client_closed && self.pending_requests.is_empty()
             && self.pending_notifications.is_empty()
     }
+
+    // A client is always ready to handle incoming messages: it's always a response, so there's
+    // never a need to apply backpressure.
+    fn ready_to_handle(&mut self) -> bool { true }
 }
 
 struct ClientAndServer<S: ServiceWithClient> {
@@ -540,6 +592,10 @@ impl<S: ServiceWithClient> MessageHandler for ClientAndServer<S> {
             Ok(Async::NotReady)
         }
     }
+
+    fn ready_to_handle(&mut self) -> bool {
+        self.server.count_active_jobs() < self.server.job_limit
+    }
 }
 
 struct InnerEndpoint<MH: MessageHandler, T: AsyncRead + AsyncWrite> {
@@ -560,6 +616,13 @@ impl<MH: MessageHandler, T: AsyncRead + AsyncWrite> Future for InnerEndpoint<MH,
             return Ok(Async::NotReady);
         }
 
+        // If the endpoint is not yet ready to handle more messages (e.g. because there are already
+        // too many simultaneous messages being handled), apply backpressure to our input stream by
+        // not reading from it.
+        if !self.handler.ready_to_handle() {
+            return Ok(Async::NotReady)
+        }
+
         trace!("Polling stream.");
         while let Async::Ready(msg) = self.stream.poll()? {
             if let Some(msg) = msg {
@@ -570,6 +633,10 @@ impl<MH: MessageHandler, T: AsyncRead + AsyncWrite> Future for InnerEndpoint<MH,
                 // possible that the client closed the stream only one way and is still waiting
                 // for response? Not for TCP at least, but maybe for other transport types?
                 return Ok(Async::Ready(()));
+            }
+
+            if !self.handler.ready_to_handle() {
+                return Ok(Async::NotReady);
             }
         }
 
@@ -623,12 +690,21 @@ impl<T: AsyncRead + AsyncWrite> Future for ClientEndpoint<T> {
 ///
 /// The returned future will run until the stream is closed; if the stream encounters an error,
 /// then the future will propagate it and terminate.
+pub fn serve_with_job_limit<'a, S: Service + 'a, T: AsyncRead + AsyncWrite + 'a>(
+    stream: T,
+    service: S,
+    job_limit: usize,
+    handle: &reactor::Handle,
+) -> Box<Future<Item = (), Error = io::Error> + 'a> {
+    Box::new(ServerEndpoint::with_job_limit(stream, service, job_limit, handle))
+}
+
 pub fn serve<'a, S: Service + 'a, T: AsyncRead + AsyncWrite + 'a>(
     stream: T,
     service: S,
     handle: &reactor::Handle,
 ) -> Box<Future<Item = (), Error = io::Error> + 'a> {
-    Box::new(ServerEndpoint::new(stream, service, handle))
+    serve_with_job_limit(stream, service, ::std::usize::MAX, handle)
 }
 
 struct ServerEndpoint<S: Service, T: AsyncRead + AsyncWrite> {
@@ -636,11 +712,11 @@ struct ServerEndpoint<S: Service, T: AsyncRead + AsyncWrite> {
 }
 
 impl<S: Service, T: AsyncRead + AsyncWrite> ServerEndpoint<S, T> {
-    pub fn new(stream: T, service: S, handle: &reactor::Handle) -> Self {
+    pub fn with_job_limit(stream: T, service: S, job_limit: usize, handle: &reactor::Handle) -> Self {
         ServerEndpoint {
             inner: InnerEndpoint {
                 stream: Transport(stream.framed(Codec)),
-                handler: Server::new(service, handle),
+                handler: Server::with_job_limit(service, job_limit, handle),
             },
         }
     }
@@ -673,7 +749,8 @@ pub struct Endpoint<S: ServiceWithClient, T: AsyncRead + AsyncWrite> {
 
 impl<S: ServiceWithClient, T: AsyncRead + AsyncWrite> Endpoint<S, T> {
     /// Creates a new `Endpoint` on `stream`, using `service` to handle requests and notifications.
-    pub fn new(stream: T, service: S, handle: &reactor::Handle) -> Self {
+    /// TODO: doc
+    pub fn with_job_limit(stream: T, service: S, job_limit: usize, handle: &reactor::Handle) -> Self {
         let (inner_client, client) = InnerClient::new();
         Endpoint {
             inner: InnerEndpoint {
@@ -681,11 +758,18 @@ impl<S: ServiceWithClient, T: AsyncRead + AsyncWrite> Endpoint<S, T> {
                 handler: ClientAndServer {
                     inner_client,
                     client,
-                    server: Server::new(service, handle),
+                    server: Server::with_job_limit(service, job_limit, handle),
                 },
             },
         }
     }
+
+    /// Creates a new `Endpoint` on `stream`, using `service` to handle requests and notifications.
+    /// TODO: doc
+    pub fn new(stream: T, service: S, handle: &reactor::Handle) -> Self {
+        Self::with_job_limit(stream, service, ::std::usize::MAX, handle)
+    }
+
 
     /// Returns a handle to the client half of this `Endpoint`, which can be used for sending
     /// requests and notifications.

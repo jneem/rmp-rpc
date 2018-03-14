@@ -20,5 +20,5 @@ pub mod message;
 mod endpoint;
 
 pub use endpoint::{Ack, Client, ClientEndpoint, Endpoint, Response, Service, ServiceWithClient};
-pub use endpoint::serve;
+pub use endpoint::{serve, serve_with_job_limit};
 pub use rmpv::{Integer, Utf8String, Value};
